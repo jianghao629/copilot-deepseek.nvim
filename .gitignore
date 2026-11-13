@@ -5,3 +5,8 @@ deps/
 /copilot/
 
 tests/files/test.txt
+
+# local test state
+.teststate/
+.testdata/
+.testcache/

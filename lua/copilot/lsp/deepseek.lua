@@ -89,16 +89,17 @@ function M.start(dispatchers)
   ---@param params table
   ---@param callback fun(err: string|nil, data: table|nil)
   local function handle_get_completions(params, callback)
+    local cfg = config.deepseek
     local bufnr = resolve_bufnr(params)
-    local prefix, suffix = util.get_fim_context(bufnr, params.doc.position)
-    local extra_context = util.get_related_files_context(bufnr, 1024)
+    local prefix, suffix = util.get_fim_context(bufnr, params.doc.position, cfg.context_chars)
+    local extra_context = util.get_related_files_context(bufnr, cfg.related_context_chars, cfg.related_context_lines)
 
     local payload = {
-      model = config.deepseek.model,
+      model = cfg.model,
       prompt = extra_context .. "\n" .. prefix,
       suffix = suffix,
-      max_tokens = 1024,
-      temperature = 0,
+      max_tokens = cfg.max_tokens,
+      temperature = cfg.temperature,
       n = 1,
     }
 
@@ -133,15 +134,16 @@ function M.start(dispatchers)
   ---@param params table
   ---@param callback fun(err: string|nil, data: table|nil)
   local function handle_get_panel_completions(params, callback)
+    local cfg = config.deepseek
     local bufnr = resolve_bufnr(params)
-    local prefix, suffix = util.get_fim_context(bufnr, params.doc.position)
-    local extra_context = util.get_related_files_context(bufnr, 1024)
+    local prefix, suffix = util.get_fim_context(bufnr, params.doc.position, cfg.context_chars)
+    local extra_context = util.get_related_files_context(bufnr, cfg.related_context_chars, cfg.related_context_lines)
 
     local payload = {
-      model = config.deepseek.model,
+      model = cfg.model,
       prompt = extra_context .. "\n" .. prefix,
       suffix = suffix,
-      max_tokens = 1024,
+      max_tokens = cfg.max_tokens,
       temperature = 0.7,
       n = 1,
     }

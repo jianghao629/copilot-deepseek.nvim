@@ -569,6 +569,18 @@ such as `deepseek-flash` or `deepseek-v4-pro`; use the model names available to
 your account. In DeepSeek mode the `server`, authentication and NES settings
 are ignored.
 
+The request size and context can be tuned:
+
+```lua
+deepseek = {
+  max_tokens = 1024,            -- upper bound for a single completion
+  temperature = 0,              -- 0 keeps completions deterministic
+  context_chars = 2048,         -- prefix/suffix characters sent to the FIM API
+  related_context_chars = 1024, -- characters of other same-filetype buffers
+  related_context_lines = 100,  -- lines read from each related buffer
+}
+```
+
 The DeepSeek backend is adapted from
 [vagmi/copilot.lua](https://github.com/vagmi/copilot.lua), which itself is a
 fork of this project released under the same MIT license.

@@ -8,11 +8,13 @@ end
 
 ---Start the plugin with the DeepSeek backend and a mocked curl response.
 ---@param response table
-local function setup_with_mocked_api(response)
+---@param deepseek_opts? table
+local function setup_with_mocked_api(response, deepseek_opts)
   child.lua(
     string.format(
       [[
         local response = vim.json.decode(%q)
+        local deepseek_opts = vim.json.decode(%q)
         _G.curl_calls = {}
         vim.system = function(cmd, _, on_exit)
           table.insert(_G.curl_calls, cmd)
@@ -26,9 +28,10 @@ local function setup_with_mocked_api(response)
             kill = function() end,
           }
         end
-        M.setup({ backend = "deepseek", deepseek = { api_key = "test-key" } })
+        M.setup({ backend = "deepseek", deepseek = vim.tbl_deep_extend("force", { api_key = "test-key" }, deepseek_opts) })
       ]],
-      vim.json.encode(response)
+      vim.json.encode(response),
+      vim.json.encode(deepseek_opts or {})
     )
   )
 
@@ -128,7 +131,38 @@ T["deepseek"]["returns completions from the FIM API"] = function()
   eq(type(request.body.prompt), "string")
   eq(type(request.body.suffix), "string")
   eq(request.body.model, "deepseek-flash")
+  eq(request.body.max_tokens, 1024)
+  eq(request.body.temperature, 0)
   eq(vim.tbl_contains(request.call, "https://api.deepseek.com/beta/completions"), true)
+end
+
+T["deepseek"]["respects DeepSeek generation options"] = function()
+  local response = { id = "test-id", choices = { { text = " short" } } }
+
+  eq(
+    setup_with_mocked_api(response, {
+      max_tokens = 64,
+      temperature = 0.2,
+      context_chars = 512,
+      related_context_chars = 256,
+      related_context_lines = 20,
+    }),
+    true
+  )
+  eq(set_buffer_lines({ "local x = 1" }), true)
+
+  local body = child.lua([[
+    local call = _G.curl_calls[#_G.curl_calls]
+    for i, value in ipairs(call) do
+      if value == "-d" then
+        return vim.json.decode(call[i + 1])
+      end
+    end
+  ]])
+
+  eq(body.max_tokens, 64)
+  eq(body.temperature, 0.2)
+  eq(#body.prompt <= 512 + 256 + 1, true)
 end
 
 T["deepseek"]["includes related files context in the prompt"] = function()

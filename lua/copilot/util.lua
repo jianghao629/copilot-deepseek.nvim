@@ -205,17 +205,19 @@ end
 ---DeepSeek backend to give the FIM request some cross-file context.
 ---@param current_bufnr integer
 ---@param max_extra_chars integer
+---@param max_lines? integer Lines read from each related buffer, defaults to 100
 ---@return string
-function M.get_related_files_context(current_bufnr, max_extra_chars)
+function M.get_related_files_context(current_bufnr, max_extra_chars, max_lines)
   local context = {}
   local total_chars = 0
   local current_ft = vim.bo[current_bufnr].filetype
+  max_lines = max_lines or 100
 
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if bufnr ~= current_bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
       local ft = vim.bo[bufnr].filetype
       if ft == current_ft and ft ~= "" then
-        local lines = vim.api.nvim_buf_get_lines(bufnr, 0, 100, false)
+        local lines = vim.api.nvim_buf_get_lines(bufnr, 0, max_lines, false)
         if #lines > 0 then
           local path = vim.api.nvim_buf_get_name(bufnr)
           local filename = vim.fn.fnamemodify(path, ":t")
@@ -242,9 +244,10 @@ end
 
 ---@param bufnr integer
 ---@param position { line: integer, character: integer } zero based LSP position
+---@param context_chars? integer Characters of prefix/suffix to keep, defaults to 2048
 ---@return string prefix
 ---@return string suffix
-function M.get_fim_context(bufnr, position)
+function M.get_fim_context(bufnr, position, context_chars)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local line = position.line or 0
   local character = position.character or 0
@@ -263,8 +266,9 @@ function M.get_fim_context(bufnr, position)
   end
   local suffix = table.concat(suffix_lines, "\n")
 
-  -- DeepSeek recommends around 2048 characters of FIM context
-  return prefix:sub(-2048), suffix:sub(1, 2048)
+  -- DeepSeek recommends around 2048 characters of FIM context by default
+  context_chars = context_chars or 2048
+  return prefix:sub(-context_chars), suffix:sub(1, context_chars)
 end
 
 return M
