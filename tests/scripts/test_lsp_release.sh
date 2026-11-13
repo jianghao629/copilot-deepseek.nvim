@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# bash -c snippets intentionally expand their positional arguments in the child.
+# shellcheck disable=SC2016
+set -Eeuo pipefail
+shopt -s inherit_errexit
+trap 'printf "Test failed at line %s (exit %s)\n" "$LINENO" "$?" >&2' ERR
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+script="$root/.github/scripts/lsp-release.sh"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+assert_eq() {
+  local expected=$1
+  local actual=$2
+  local message=$3
+  [[ "$actual" == "$expected" ]] || fail "$message: expected '$expected', got '$actual'"
+}
+
+assert_fails() {
+  local message=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    fail "$message: command unexpectedly succeeded"
+  fi
+}
+
+assert_fails_with() {
+  local message=$1
+  local expected=$2
+  shift 2
+  local output
+  if output=$("$@" 2>&1); then
+    fail "$message: command unexpectedly succeeded"
+  fi
+  [[ "$output" == *"$expected"* ]] || fail "$message: expected '$expected' in '$output'"
+}
+
+new_fixture() {
+  local name=$1
+  local dir="$tmp/$name"
+  git init --initial-branch=master --bare "$dir-origin.git" >/dev/null
+  git init --initial-branch=master "$dir" >/dev/null
+  git -C "$dir" config user.name test
+  git -C "$dir" config user.email test@example.com
+  git -C "$dir" remote add origin "$dir-origin.git"
+  mkdir -p "$dir/lua/copilot"
+  mkdir -p "$dir/lua/copilot/lsp"
+  printf 'return {\n  version = "1.527.1",\n  assets = {},\n}\n' >"$dir/lua/copilot/lsp/release.lua"
+  printf '{\n  ".": "3.0.3"\n}\n' >"$dir/.release-please-manifest.json"
+  git -C "$dir" add .
+  git -C "$dir" commit -m initial >/dev/null
+  printf '%s\n' "$dir"
+}
+
+repo=$(new_fixture main)
+assert_eq false "$(cd "$repo" && bash "$script" needs-lsp-update 1.527.1)" "installed LSP"
+assert_eq true "$(cd "$repo" && bash "$script" needs-lsp-update 1.528.0)" "new LSP"
+
+git -C "$repo" tag v2.9.9
+git -C "$repo" tag v3.0.2
+git -C "$repo" tag v4.00.0
+git -C "$repo" tag v99.0.0-rc.1
+git -C "$repo" tag not-semver
+assert_eq 3.0.3 "$(cd "$repo" && bash "$script" next-patch)" "next stable patch"
+assert_fails "leading-zero LSP version" bash -c 'cd "$1" && bash "$2" needs-lsp-update "$3"' _ "$repo" "$script" 01.527.1
+
+# No unchecked, working-tree-based tag publication interface may remain.
+assert_fails_with 'legacy tag command removed' 'Usage:' bash -c 'cd "$1" && bash "$2" tag HEAD' _ "$repo" "$script"
+
+untagged_repo=$(new_fixture untagged)
+assert_fails "missing stable plugin tag" bash -c 'cd "$1" && bash "$2" next-patch' _ "$untagged_repo" "$script"
+
+# Git refs, pushes and rejected pushes use real repositories. Mock GitHub and
+# sleep so delayed API visibility can be exercised without real polling delays.
+mkdir "$tmp/bin"
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == release && "$2" == create ]]; then
+  shift 2
+  tag=$1
+  shift
+  repo= title= target= previous= verify=false generated=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo=$2; shift 2 ;;
+      --title) title=$2; shift 2 ;;
+      --target) target=$2; shift 2 ;;
+      --notes-start-tag) previous=$2; shift 2 ;;
+      --verify-tag) verify=true; shift ;;
+      --generate-notes) generated=true; shift ;;
+      *) exit 92 ;;
+    esac
+  done
+  [[ "$repo" == test/project && "$title" == "$tag" && "$verify" == true && "$generated" == true ]] || exit 93
+  sha=$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)
+  [[ -n "$sha" && "$target" == "$sha" ]] || exit 94
+  git rev-parse --verify "refs/tags/$previous^{commit}" >/dev/null
+  jq -cn --arg tag "$tag" --arg sha "$sha" --arg previous "$previous" '{$tag,$sha,$previous}' >>"$RELEASE_CALLS"
+  [[ ${CREATE_ERROR:-0} == 0 ]] || exit 1
+  jq -e --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | length == 0' "$RELEASES_FILE" >/dev/null || exit 95
+  jq --arg tag "$tag" '. [0] += [{tag_name:$tag,draft:false,prerelease:false}]' "$RELEASES_FILE" >"$RELEASES_FILE.tmp"
+  mv "$RELEASES_FILE.tmp" "$RELEASES_FILE"
+  if [[ -n ${POST_CREATE_STATE:-} ]]; then
+    printf '0\n' >"$VISIBILITY_READS"
+  fi
+  exit
+fi
+[[ "$1" == api && "$2" == repos/test/project/* ]] || exit 90
+case "$2" in
+  */releases\?*)
+    [[ ${RELEASE_ERROR:-0} == 0 ]] || exit 1
+    if [[ -n ${POST_CREATE_STATE:-} && -f "$VISIBILITY_READS" ]]; then
+      reads=$(cat "$VISIBILITY_READS")
+      printf '%s\n' "$((reads + 1))" >"$VISIBILITY_READS"
+      case "$POST_CREATE_STATE" in
+        delayed)
+          if (( reads < 2 )); then printf '[[]]\n'; exit; fi ;;
+        missing) printf '[[]]\n'; exit ;;
+        error) exit 1 ;;
+        malformed) printf 'not JSON\n'; exit ;;
+        draft|prerelease)
+          jq --arg field "$POST_CREATE_STATE" '.[0][0][$field] = true' "$RELEASES_FILE"
+          exit ;;
+      esac
+    fi
+    if [[ -n ${RELEASE_JSON:-} ]]; then
+      printf '%s\n' "$RELEASE_JSON"
+    else
+      cat "$RELEASES_FILE"
+    fi
+    ;;
+  */pulls*)
+    [[ ${PR_ERROR:-0} == 0 ]] || exit 1
+    printf '[%s]\n' "$PR_JSON"
+    ;;
+  */tags*)
+    [[ ${TAG_ERROR:-0} == 0 ]] || exit 1
+    if [[ ${TAG_HIDDEN:-0} == 1 ]]; then
+      printf '[[]]\n'
+    else
+      git ls-remote --tags origin | jq -Rn --arg hide "${HIDE_TAG:-}" '[[inputs | capture("^(?<sha>[^\\t]+)\\trefs/tags/(?<name>.*)$") | select(.name != $hide) | {name, commit: {sha}}]]'
+    fi
+    ;;
+  *) exit 91 ;;
+esac
+STUB
+chmod +x "$tmp/bin/gh"
+cat >"$tmp/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 1 && "$1" == 5 ]] || exit 96
+printf '%s\n' "$1" >>"$SLEEP_CALLS"
+# Also bound broken polling loops so the suite cannot hang.
+[[ $(wc -l <"$SLEEP_CALLS") -le 6 ]] || exit 97
+STUB
+chmod +x "$tmp/bin/sleep"
+export PATH="$tmp/bin:$PATH" GH_TOKEN=test GITHUB_REPOSITORY=test/project
+export RELEASES_FILE="$tmp/releases.json" RELEASE_CALLS="$tmp/release-calls.jsonl"
+export VISIBILITY_READS="$tmp/visibility-reads" SLEEP_CALLS="$tmp/sleep-calls"
+printf '[[]]\n' >"$RELEASES_FILE"
+touch "$RELEASE_CALLS"
+
+run_helper() { (cd "$repo" && bash "$script" "$@"); }
+repo=$(new_fixture ordered)
+git -C "$repo" tag v3.0.3
+git -C "$repo" push origin HEAD:master --tags >/dev/null
+base=$(git -C "$repo" rev-parse HEAD)
+printf '{".":"3.0.4"}\n' >"$repo/.release-please-manifest.json"
+printf 'return { version = "1.528.0" }\n' >"$repo/lua/copilot/lsp/release.lua"
+git -C "$repo" add .
+git -C "$repo" commit -m 'update metadata' >/dev/null
+merge_sha=$(git -C "$repo" rev-parse HEAD)
+export PR_JSON
+PR_JSON=$(jq -n --arg sha "$merge_sha" '[{merged_at:"2026-09-07T00:00:00Z", merge_commit_sha:$sha, base:{ref:"master",repo:{full_name:"test/project"}}, head:{ref:"create-pull-request/update-copilot-lsp",repo:{full_name:"test/project"}}}]')
+good_pr=$PR_JSON
+run_helper check-pr "$base" "$merge_sha"
+printf 'not JSON\n' >"$repo/.release-please-manifest.json"
+run_helper check-pr "$base" "$merge_sha" # Must read refs, not worktree.
+git -C "$repo" restore .release-please-manifest.json
+assert_fails 'base is not an ancestor' run_helper check-pr "$merge_sha" "$base"
+assert_fails 'invalid ref' run_helper check-pr nonexistent "$merge_sha"
+TAG_HIDDEN=1 assert_fails 'base not published' run_helper check-pr "$base" "$merge_sha"
+TAG_ERROR=1 assert_fails 'tag API failure' run_helper check-pr "$base" "$merge_sha"
+
+printf 'later unrelated change\n' >"$repo/unrelated"
+git -C "$repo" add unrelated
+git -C "$repo" commit -m unrelated >/dev/null
+assert_fails 'extra file' run_helper check-pr "$base" HEAD
+assert_fails 'current base has unpublished boundary' run_helper check-pr "$merge_sha" HEAD
+git -C "$repo" push origin HEAD:master >/dev/null
+for mutation in '[]' '.[0].merged_at = null' '.[0].merge_commit_sha = "wrong"' '.[0].head.repo.full_name = "fork/project"' '.[0].base.repo.full_name = "fork/project"' '.[0].base.ref = "other"' '.[0].head.ref = "other"'; do
+  PR_JSON=$(jq "$mutation" <<<"$good_pr")
+  assert_fails "unverified provenance: $mutation" run_helper reconcile
+  assert_fails 'no tag on rejected provenance' git -C "$repo" show-ref --verify refs/tags/v3.0.4
+done
+PR_JSON='not JSON'
+assert_fails 'malformed PR API' run_helper reconcile
+PR_JSON=$good_pr
+PR_ERROR=1 assert_fails 'PR API failure' run_helper reconcile
+
+# A rejected push leaves a local tag; retry must also work without that local state.
+printf '#!/bin/sh\nexit 1\n' >"$repo-origin.git/hooks/pre-receive"
+chmod +x "$repo-origin.git/hooks/pre-receive"
+assert_fails 'rejected push' run_helper reconcile
+assert_fails 'remote remains untagged' git --git-dir="$repo-origin.git" show-ref --verify refs/tags/v3.0.4
+rm "$repo-origin.git/hooks/pre-receive"
+git clone "$repo-origin.git" "$tmp/retry" >/dev/null
+repo="$tmp/retry"
+HIDE_TAG=v3.0.4 assert_fails 'publication not visible' run_helper reconcile
+assert_eq "$merge_sha" "$(git -C "$repo" rev-parse v3.0.4)" 'visibility fails after push'
+assert_eq '' "$(cat "$RELEASE_CALLS")" 'no release before verified tag publication'
+run_helper reconcile
+assert_eq "$merge_sha" "$(git -C "$repo" rev-parse v3.0.4)" 'tag merge rather than later HEAD'
+assert_eq v3.0.4 "$(jq -r '.[0][0].tag_name' "$RELEASES_FILE")" 'existing tag gets a GitHub release'
+assert_eq "$merge_sha" "$(jq -r '.sha' "$RELEASE_CALLS")" 'release uses merge commit, not later HEAD'
+assert_eq v3.0.3 "$(jq -r '.previous' "$RELEASE_CALLS")" 'release notes start at previous plugin boundary'
+run_helper reconcile
+assert_eq 1 "$(wc -l <"$RELEASE_CALLS" | tr -d ' ')" 'rerun does not duplicate publication'
+
+# A tag-only state from a failed release creation is repaired on a fresh run.
+printf '[[]]\n' >"$RELEASES_FILE"
+CREATE_ERROR=1 assert_fails 'release creation failure propagates' run_helper reconcile
+assert_eq "$merge_sha" "$(git -C "$repo" rev-parse v3.0.4)" 'failed release creation preserves tag'
+assert_eq 0 "$(jq '[.[][]] | length' "$RELEASES_FILE")" 'failed creation leaves missing release'
+run_helper reconcile
+assert_eq v3.0.4 "$(jq -r '.[0][0].tag_name' "$RELEASES_FILE")" 'retry repairs tag-only publication'
+
+# A successful create can precede visibility in GitHub's release list. Poll only
+# that missing state; never repeat the create or hide API/conflict failures.
+for state in delayed missing error malformed draft prerelease; do
+  printf '[[]]\n' >"$RELEASES_FILE"
+  rm -f "$VISIBILITY_READS"
+  : >"$SLEEP_CALLS"
+  before=$(wc -l <"$RELEASE_CALLS")
+  case "$state" in
+    delayed)
+      POST_CREATE_STATE=$state run_helper reconcile
+      assert_eq 3 "$(cat "$VISIBILITY_READS")" 'wait until release becomes visible'
+      assert_eq 2 "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" 'space visibility checks'
+      ;;
+    missing)
+      POST_CREATE_STATE=$state assert_fails_with 'visibility timeout' 'GitHub release is not published for v3.0.4' run_helper reconcile
+      assert_eq 7 "$(cat "$VISIBILITY_READS")" 'visibility polling is bounded'
+      assert_eq 6 "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" 'no sleep after final check'
+      ;;
+    *)
+      POST_CREATE_STATE=$state assert_fails_with "post-create $state" 'Unable to read published release state' run_helper reconcile
+      assert_eq 1 "$(cat "$VISIBILITY_READS")" 'invalid observations fail immediately'
+      assert_eq '' "$(cat "$SLEEP_CALLS")" 'invalid observations are never retried'
+      ;;
+  esac
+  assert_eq "$((before + 1))" "$(wc -l <"$RELEASE_CALLS" | tr -d ' ')" 'polling never republishes'
+done
+rm -f "$VISIBILITY_READS"
+: >"$SLEEP_CALLS"
+
+# Existing releases must not turn API failures or draft conflicts into writes.
+calls=$(cat "$RELEASE_CALLS")
+RELEASE_ERROR=1 assert_fails 'release API error' run_helper reconcile
+for invalid in 'not JSON' '{}' '[[{}]]' '[[{"tag_name":"v3.0.4","draft":true,"prerelease":false}]]' '[[{"tag_name":"v3.0.4","draft":false,"prerelease":true}]]'; do
+  RELEASE_JSON=$invalid assert_fails 'invalid or unpublished release state' run_helper reconcile
+done
+assert_eq "$calls" "$(cat "$RELEASE_CALLS")" 'failed release lookups never attempt publication'
+
+# Recovery must validate provenance even when the tag already exists.
+printf '[[]]\n' >"$RELEASES_FILE"
+PR_JSON='[]' assert_fails 'tag-only recovery requires LSP provenance' run_helper reconcile
+PR_ERROR=1 assert_fails 'tag-only recovery requires working provenance API' run_helper reconcile
+assert_eq "$calls" "$(cat "$RELEASE_CALLS")" 'unverified recovery never publishes'
+run_helper reconcile
+
+# Release Please owns normal releases: preserve their existing notes and state
+# without requiring LSP provenance. Releases may be on a later API page.
+normal_repo=$(new_fixture normal)
+saved_repo=$repo
+repo=$normal_repo
+git -C "$repo" tag v3.0.3
+git -C "$repo" push origin HEAD:master --tags >/dev/null
+normal='[[],[{"tag_name":"v3.0.3","draft":false,"prerelease":false,"body":"Normal release notes"}]]'
+printf '%s\n' "$normal" >"$RELEASES_FILE"
+calls=$(cat "$RELEASE_CALLS")
+PR_ERROR=1 run_helper reconcile
+assert_eq "$normal" "$(cat "$RELEASES_FILE")" 'normal release preserved'
+assert_eq "$calls" "$(cat "$RELEASE_CALLS")" 'normal release not republished'
+
+# New tag publication must create the release in the same invocation. A tag
+# pointing to the wrong ancestor must not become a release during recovery.
+printf '{".":"3.0.4"}\n' >"$repo/.release-please-manifest.json"
+printf 'new metadata\n' >>"$repo/lua/copilot/lsp/release.lua"
+git -C "$repo" add .
+git -C "$repo" commit -m 'update LSP' >/dev/null
+fresh_sha=$(git -C "$repo" rev-parse HEAD)
+PR_JSON=$(jq --arg sha "$fresh_sha" '.[0].merge_commit_sha = $sha' <<<"$good_pr")
+git -C "$repo" tag v3.0.4 HEAD^
+git -C "$repo" push origin HEAD:master --tags >/dev/null
+assert_fails 'tag-only release must point to verified LSP merge' run_helper reconcile
+assert_eq "$calls" "$(cat "$RELEASE_CALLS")" 'wrong tag never gets a release'
+git -C "$repo" push origin :refs/tags/v3.0.4 >/dev/null
+git -C "$repo" tag -d v3.0.4 >/dev/null
+POST_CREATE_STATE=delayed run_helper reconcile
+assert_eq "$fresh_sha" "$(git -C "$repo" rev-parse v3.0.4)" 'new tag at LSP merge'
+assert_eq 'v3.0.3 v3.0.4' "$(jq -r '[.[][] | .tag_name] | sort | join(" ")' "$RELEASES_FILE")" 'new LSP release coexists with normal release'
+assert_eq 'Normal release notes' "$(jq -r '.[][] | select(.tag_name == "v3.0.3") | .body' "$RELEASES_FILE")" 'publication preserves normal release notes'
+repo=$saved_repo
+PR_JSON=$good_pr
+printf '[[{"tag_name":"v3.0.4","draft":false,"prerelease":false}]]\n' >"$RELEASES_FILE"
+
+# A tag on a different history cannot establish a published boundary.
+saved_repo=$repo
+repo=$(new_fixture bad-ancestry)
+initial=$(git -C "$repo" rev-parse HEAD)
+git -C "$repo" checkout --orphan other >/dev/null 2>&1
+git -C "$repo" commit -m other >/dev/null
+git -C "$repo" tag v3.0.3
+git -C "$repo" checkout --detach "$initial" >/dev/null 2>&1
+git -C "$repo" push origin HEAD:refs/heads/master --tags >/dev/null
+assert_fails 'invalid published tag ancestry' run_helper reconcile
+repo=$saved_repo
+
+# A current base boundary prevents accepting an allocation that skips a patch.
+base=$(git -C "$repo" rev-parse HEAD)
+git -C "$repo" config user.name test
+git -C "$repo" config user.email test@example.com
+printf '{".":"3.0.6"}\n' >"$repo/.release-please-manifest.json"
+printf 'next metadata\n' >>"$repo/lua/copilot/lsp/release.lua"
+git -C "$repo" add .
+git -C "$repo" commit -m stale >/dev/null
+assert_fails 'skipped patch' run_helper check-pr "$base" HEAD
+stale_sha=$(git -C "$repo" rev-parse HEAD)
+PR_JSON=$(jq --arg sha "$stale_sha" '.[0].merge_commit_sha = $sha' <<<"$good_pr")
+assert_fails_with 'stale reconciliation' 'Manifest version 3.0.6 is stale; expected 3.0.5' run_helper reconcile
+assert_fails 'stale tag not created locally' git -C "$repo" show-ref --verify refs/tags/v3.0.6
+assert_fails 'stale tag not published' git --git-dir="$tmp/ordered-origin.git" show-ref --verify refs/tags/v3.0.6
+
+printf 'LSP release helper tests passed\n'

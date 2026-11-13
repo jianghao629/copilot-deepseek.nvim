@@ -1,0 +1,151 @@
+name: Update Copilot LSP
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update_copilot_lsp:
+    runs-on: ubuntu-latest
+    name: Update Copilot LSP
+    concurrency:
+      group: copilot-lsp-update
+      cancel-in-progress: false
+    if: >-
+      github.repository == 'zbirenbaum/copilot.lua' &&
+      github.event_name != 'pull_request'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve latest semver release
+        id: resolve
+        run: |
+          set -euo pipefail
+          # GitHub's `releases/latest` endpoint sorts by created_at, so a backport
+          # patch published to an older minor wins over a newer minor. Pick the
+          # highest semver instead by parsing tag_name as MAJOR.MINOR.PATCH.
+          selected_release="$RUNNER_TEMP/copilot-selected-release.json"
+          gh api --paginate --header 'Accept: application/vnd.github+json' \
+            "/repos/github/copilot-language-server-release/releases?per_page=100" \
+            | jq -s -e '[add[] | select(.prerelease == false and .draft == false and (.tag_name | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\z")))] | sort_by(.tag_name | split(".") | map(tonumber)) | last' >"$selected_release"
+          tag=$(jq -er '.tag_name' "$selected_release")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_json=$selected_release" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check release tag
+        id: release
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          manifest_version=$(jq -er '.["."] | select(type == "string")' .release-please-manifest.json)
+          if git show-ref --verify --quiet "refs/tags/v$manifest_version"; then
+            ready=true
+          else
+            ready=false
+            echo "Manifest tag v$manifest_version is pending; skipping LSP update" >&2
+          fi
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
+      - name: Check for LSP update
+        if: steps.release.outputs.ready == 'true'
+        id: update
+        run: |
+          set -euo pipefail
+          required=$(bash .github/scripts/lsp-release.sh needs-lsp-update "${{ steps.resolve.outputs.tag }}")
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+
+      - name: Generate LSP release metadata
+        if: steps.update.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          bash .github/scripts/update-lsp-metadata.sh \
+            "${{ steps.resolve.outputs.release_json }}" \
+            lua/copilot/lsp/release.lua
+
+      - name: Refresh tags before version bump
+        if: steps.update.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+      - name: Bump plugin patch version
+        if: steps.update.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          version=$(bash .github/scripts/lsp-release.sh next-patch)
+          jq --arg version "$version" '.["."] = $version' .release-please-manifest.json > .release-please-manifest.json.tmp
+          mv .release-please-manifest.json.tmp .release-please-manifest.json
+
+      - name: Set up Neovim and dependencies
+        if: steps.update.outputs.required == 'true'
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+
+      - name: Install workflow validation tools
+        if: steps.update.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacheck
+          cargo install stylua
+          make deps
+          go install github.com/rhysd/actionlint/cmd/actionlint@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Set up release tooling runtime
+        id: node
+        if: steps.update.outputs.required == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install pinned release tooling outside repository
+        id: release_deps
+        if: steps.update.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/release-please" --no-save --package-lock=false --ignore-scripts release-please@17.6.0
+          echo "NODE_PATH=$RUNNER_TEMP/release-please/node_modules" >> "$GITHUB_ENV"
+
+      - name: Validate generated update
+        if: steps.update.outputs.required == 'true'
+        run: |
+          set -euo pipefail
+          make lint
+          make test
+          bash tests/scripts/test_lsp_release.sh
+          bash tests/scripts/test_lsp_update_workflow.sh
+          bash tests/scripts/test_update_lsp_metadata.sh
+          ruby tests/scripts/test_release_workflow.rb
+          node --test tests/scripts/test_release_pr.cjs
+          actionlint
+
+      - name: Create Pull Request
+        if: steps.update.outputs.required == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          add-paths: |
+            lua/copilot/lsp/release.lua
+            .release-please-manifest.json
+          author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+          base: master
+          branch: create-pull-request/update-copilot-lsp
+          commit-message: "chore: update to latest Copilot LSP"
+          title: "Update Copilot LSP"

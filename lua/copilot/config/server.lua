@@ -1,0 +1,29 @@
+---@alias ServerType string<'nodejs', 'binary', 'deepseek'>
+
+---@class (exact) ServerConfig
+---@field type ServerType Type of the server
+---@field custom_server_filepath? string|nil Path to the custom server file, can be absolute, relative or a file name (for PATH)
+
+local server = {
+  ---@type ServerConfig
+  default = {
+    type = "binary",
+    custom_server_filepath = nil,
+  },
+}
+
+-- TODO: add support for relative paths
+---@param config ServerConfig
+function server.validate(config)
+  vim.validate("type", config.type, function(server_type)
+    return type(server_type) == "string"
+      and (server_type == "nodejs" or server_type == "binary" or server_type == "deepseek")
+  end, false, "nodejs, binary or deepseek")
+  vim.validate("custom_server_filepath", config.custom_server_filepath, { "string", "nil" })
+
+  if config.custom_server_filepath then
+    config.custom_server_filepath = vim.fs.normalize(config.custom_server_filepath)
+  end
+end
+
+return server
